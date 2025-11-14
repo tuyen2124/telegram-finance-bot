@@ -4,13 +4,15 @@
 # - Ghi thu/chi, mục tiêu tiết kiệm, báo cáo
 # - Quản lý danh mục, hạn mức chi tiêu, sửa/xoá giao dịch
 # - Multi ví: 4 ví mặc định theo quy tắc 4-2-2-2 + lệnh /salary tự chia lương
-# - /export: xuất toàn bộ giao dịch ra file CSV
+# - Xuất CSV: /export (toàn bộ), /export_month (theo tháng), /export_wallet (theo ví)
+# - Tính năng thêm (không tốn phí): /wallets_add, /transfer, /insights, /backup
 # - Webhook với aiogram v3 + aiohttp + SQLite
 #
 # TẤT CẢ tin nhắn & comment: tiếng Việt.
 
 import logging
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, date
 from typing import Optional, Tuple
@@ -47,6 +49,7 @@ DB_PATH = os.getenv("DB_PATH", "finance_bot.db")
 # ==========================
 # HÀM HỖ TRỢ: PARSE TIỀN VIỆT
 # ==========================
+
 
 def parse_vietnamese_money(text: str) -> float:
     """
@@ -113,6 +116,7 @@ def extract_amount_and_note(raw: str) -> Tuple[float, str]:
 # ==========================
 # LỚP DB
 # ==========================
+
 
 class Database:
     def __init__(self, path: str):
@@ -710,12 +714,69 @@ class Database:
         )
         return cur.fetchall()
 
+    def get_transactions_for_month_export(self, user_id: int, year: int, month: int):
+        """
+        Lấy toàn bộ giao dịch trong 1 tháng, join tên ví để export CSV.
+        """
+        first = datetime(year, month, 1)
+        if month == 12:
+            last = datetime(year + 1, 1, 1)
+        else:
+            last = datetime(year, month + 1, 1)
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                t.id,
+                t.created_at,
+                t.type,
+                t.amount,
+                t.category,
+                t.note,
+                w.name AS wallet_name
+            FROM transactions t
+            LEFT JOIN wallets w ON t.wallet_id = w.id
+            WHERE t.user_id = ?
+              AND t.created_at BETWEEN ? AND ?
+            ORDER BY t.created_at ASC, t.id ASC
+            """,
+            (user_id, first.isoformat(), last.isoformat()),
+        )
+        return cur.fetchall()
+
+    def get_transactions_for_wallet_export(self, user_id: int, wallet_id: int):
+        """
+        Lấy toàn bộ giao dịch của user cho 1 ví cụ thể, để export CSV.
+        """
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                t.id,
+                t.created_at,
+                t.type,
+                t.amount,
+                t.category,
+                t.note,
+                w.name AS wallet_name
+            FROM transactions t
+            LEFT JOIN wallets w ON t.wallet_id = w.id
+            WHERE t.user_id = ?
+              AND t.wallet_id = ?
+            ORDER BY t.created_at ASC, t.id ASC
+            """,
+            (user_id, wallet_id),
+        )
+        return cur.fetchall()
+
 
 db = Database(DB_PATH)
 
 # ==========================
 # FSM STATES
 # ==========================
+
 
 class AddTransactionStates(StatesGroup):
     choosing_type = State()
@@ -757,6 +818,21 @@ class SalaryStates(StatesGroup):
     entering_amount = State()
 
 
+class ExportMonthStates(StatesGroup):
+    entering_period = State()
+
+
+class TransferStates(StatesGroup):
+    choosing_from_wallet = State()
+    choosing_to_wallet = State()
+    entering_amount = State()
+    entering_note = State()
+
+
+class WalletAddStates(StatesGroup):
+    entering_name = State()
+
+
 # context tạm
 user_goal_action_context: dict[int, dict] = {}
 user_edit_tx_context: dict[int, dict] = {}
@@ -764,6 +840,7 @@ user_edit_tx_context: dict[int, dict] = {}
 # ==========================
 # KEYBOARD
 # ==========================
+
 
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -882,27 +959,53 @@ router = Router()
 
 # ---------- /start ----------
 
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-    db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
     await state.clear()
+
+    # Tóm tắt nhanh hôm nay
+    today = date.today()
+    start_today = datetime(today.year, today.month, today.day)
+    end_today = start_today + timedelta(days=1)
+    summary_today = db.get_summary(user_id, start_today, end_today)
+    income_today = summary_today["income"]
+    expense_today = summary_today["expense"]
+
+    total_balance = db.get_balance(user_id)
+    db.ensure_default_wallets(user_id)
+    wallets = db.get_wallets(user_id)
+
+    wallet_lines = []
+    for w in wallets[:3]:  # chỉ hiện tối đa 3 ví cho gọn
+        bal = db.get_wallet_balance(user_id, w["id"])
+        wallet_lines.append(f"• {w['name']}: `{bal:,.0f}`")
+
+    wallet_text = "\n".join(wallet_lines) if wallet_lines else "Chưa có ví nào."
+
     text = (
         f"Xin chào *{message.from_user.full_name}* 👋\n\n"
         "Mình là bot quản lý tài chính cá nhân.\n\n"
+        "📊 *Tóm tắt nhanh hôm nay:*\n"
+        f"• Thu nhập: `{income_today:,.0f}`\n"
+        f"• Chi tiêu: `{expense_today:,.0f}`\n"
+        f"• Số dư (tổng thu - chi): `{total_balance:,.0f}`\n\n"
+        "💼 *Một vài ví gần đây:*\n"
+        f"{wallet_text}\n\n"
         "Bạn có thể:\n"
         "• Ghi *Thu nhập* hoặc *Chi tiêu* (hỗ trợ nhập kiểu `35k ăn sáng`)\n"
-        "• Quản lý *nhiều ví* (4 ví mặc định theo 4-2-2-2)\n"
-        "• Ghi lương bằng /salary để tự chia tiền vào 4 ví\n"
-        "• Tạo & theo dõi *Mục tiêu tiết kiệm*\n"
-        "• Đặt *hạn mức chi tiêu* theo danh mục\n"
-        "• Xem *báo cáo* ngày/tuần/tháng/theo danh mục\n"
-        "• Xuất dữ liệu ra CSV bằng /export\n\n"
+        "• Ghi lương bằng /salary để tự chia 4-2-2-2 vào 4 ví\n"
+        "• Tạo & theo dõi *Mục tiêu tiết kiệm* (/goals, /goals_add)\n"
+        "• Xem *báo cáo* bằng /report hoặc /insights\n"
+        "• Xuất dữ liệu CSV bằng /export, /export_month, /export_wallet\n\n"
         "Dùng các nút bên dưới hoặc gõ /help để xem chi tiết."
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
 
 
 # ---------- /help ----------
+
 
 @router.message(Command("help"))
 async def cmd_help(message: Message):
@@ -912,19 +1015,27 @@ async def cmd_help(message: Message):
         "• /add – Thêm giao dịch Thu nhập / Chi tiêu\n"
         "• /salary – Ghi lương và tự chia 4-2-2-2 vào 4 ví\n"
         "• /wallets – Xem số dư từng ví\n"
+        "• /wallets_add – Tạo ví mới\n"
+        "• /transfer – Chuyển tiền giữa các ví\n"
         "• /transactions – Xem & quản lý giao dịch gần đây\n"
         "• /report – Xem báo cáo tài chính\n"
+        "• /insights – Phân tích chi tiêu thông minh\n"
         "• /goals – Quản lý mục tiêu tiết kiệm\n"
+        "• /goals_add – Tạo mục tiêu tiết kiệm mới\n"
         "• /budget – Tính ngân sách 4-2-2-2\n"
         "• /categories – Quản lý danh mục thu/chi\n"
         "• /limit – Đặt hạn mức chi tiêu theo danh mục\n"
-        "• /export – Xuất toàn bộ giao dịch ra file CSV\n\n"
+        "• /export – Xuất toàn bộ giao dịch ra file CSV\n"
+        "• /export_month – Xuất giao dịch theo tháng\n"
+        "• /export_wallet – Xuất giao dịch theo từng ví\n"
+        "• /backup – Sao lưu file database\n\n"
         "Bạn cũng có thể dùng menu nhanh bên dưới để thao tác."
     )
     await message.answer(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_kb())
 
 
 # ---------- MENU REPLY BUTTONS ----------
+
 
 @router.message(F.text == "➕ Thu nhập")
 async def add_income_btn(message: Message, state: FSMContext):
@@ -967,6 +1078,7 @@ async def wallets_btn(message: Message):
 
 
 # ---------- /add ----------
+
 
 @router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
@@ -1153,6 +1265,7 @@ async def add_tx_wallet(message: Message, state: FSMContext):
 
 # ---------- /budget – Quy tắc 4-2-2-2 ----------
 
+
 @router.message(Command("budget"))
 async def cmd_budget(message: Message, state: FSMContext):
     await state.set_state(BudgetStates.entering_income)
@@ -1248,6 +1361,7 @@ async def cb_budget_goals(call: CallbackQuery):
 
 # ---------- /salary – tự chia lương vào 4 ví ----------
 
+
 @router.message(Command("salary"))
 async def cmd_salary(message: Message, state: FSMContext):
     db.get_or_create_user(message.from_user.id, message.from_user.full_name)
@@ -1341,6 +1455,7 @@ async def salary_enter_amount(message: Message, state: FSMContext):
 
 # ---------- /wallets – xem số dư ví ----------
 
+
 @router.message(Command("wallets"))
 async def cmd_wallets(message: Message):
     user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
@@ -1368,7 +1483,212 @@ async def cmd_wallets(message: Message):
     )
 
 
+# ---------- /wallets_add – tạo ví mới ----------
+
+
+@router.message(Command("wallets_add"))
+async def cmd_wallets_add(message: Message, state: FSMContext):
+    db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    await state.set_state(WalletAddStates.entering_name)
+    await message.answer(
+        "💼 *Tạo ví mới*\n\n"
+        "Nhập tên ví bạn muốn tạo (ví dụ: `Momo`, `Tiền mặt`, `Thẻ tín dụng`):",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@router.message(WalletAddStates.entering_name)
+async def wallets_add_enter_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not name:
+        await message.answer("❌ Tên ví không được để trống, vui lòng nhập lại.")
+        return
+
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    db.add_wallet(user_id, name, purpose="")
+    await state.clear()
+    await message.answer(
+        f"✅ Đã tạo ví mới: *{name}*.\nDùng /wallets để xem danh sách ví.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ---------- /transfer – chuyển tiền giữa ví ----------
+
+
+@router.message(Command("transfer"))
+async def cmd_transfer(message: Message, state: FSMContext):
+    """
+    Chuyển tiền giữa các ví: ghi 1 giao dịch chi ở ví nguồn, 1 giao dịch thu ở ví đích.
+    """
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    db.ensure_default_wallets(user_id)
+    wallets = db.get_wallets(user_id)
+    if len(wallets) < 2:
+        await message.answer(
+            "Bạn cần ít nhất 2 ví để chuyển tiền.\n"
+            "Dùng /wallets_add để tạo thêm ví.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    buttons = []
+    row = []
+    for w in wallets:
+        row.append(KeyboardButton(text=w["name"]))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
+
+    await state.set_state(TransferStates.choosing_from_wallet)
+    await message.answer(
+        "🔁 *Chuyển tiền giữa ví*\n\n"
+        "Bước 1: Chọn *ví nguồn* (ví bị trừ tiền):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+@router.message(TransferStates.choosing_from_wallet)
+async def transfer_choose_from(message: Message, state: FSMContext):
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    wallets = db.get_wallets(user_id)
+    name = (message.text or "").strip()
+
+    from_wallet = None
+    for w in wallets:
+        if w["name"].lower() == name.lower():
+            from_wallet = w
+            break
+
+    if not from_wallet:
+        await message.answer("❌ Không tìm thấy ví này, vui lòng chọn lại từ danh sách.")
+        return
+
+    await state.update_data(from_wallet_id=from_wallet["id"])
+    # Chọn ví đích
+    buttons = []
+    row = []
+    for w in wallets:
+        if w["id"] == from_wallet["id"]:
+            continue
+        row.append(KeyboardButton(text=w["name"]))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    kb = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
+
+    await state.set_state(TransferStates.choosing_to_wallet)
+    await message.answer(
+        "Bước 2: Chọn *ví đích* (ví được cộng tiền):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+@router.message(TransferStates.choosing_to_wallet)
+async def transfer_choose_to(message: Message, state: FSMContext):
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    wallets = db.get_wallets(user_id)
+    data = await state.get_data()
+    from_wallet_id = data["from_wallet_id"]
+
+    name = (message.text or "").strip()
+    to_wallet = None
+    for w in wallets:
+        if w["name"].lower() == name.lower():
+            to_wallet = w
+            break
+
+    if not to_wallet or to_wallet["id"] == from_wallet_id:
+        await message.answer("❌ Ví đích không hợp lệ, vui lòng chọn lại.")
+        return
+
+    await state.update_data(to_wallet_id=to_wallet["id"])
+
+    await state.set_state(TransferStates.entering_amount)
+    await message.answer(
+        "Bước 3: Nhập *số tiền cần chuyển* (ví dụ: `500k`, `1tr`, `1000000`):",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(TransferStates.entering_amount)
+async def transfer_enter_amount(message: Message, state: FSMContext):
+    raw = message.text
+    try:
+        amount, _ = extract_amount_and_note(raw)
+        if amount <= 0:
+            raise ValueError()
+    except Exception:
+        await message.answer("❌ Số tiền không hợp lệ, vui lòng nhập lại.")
+        return
+
+    await state.update_data(amount=amount)
+    await state.set_state(TransferStates.entering_note)
+    await message.answer(
+        "Bước 4: Nhập ghi chú cho lần chuyển (hoặc gõ `-` nếu không có):",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@router.message(TransferStates.entering_note)
+async def transfer_enter_note(message: Message, state: FSMContext):
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    data = await state.get_data()
+    from_wallet_id = data["from_wallet_id"]
+    to_wallet_id = data["to_wallet_id"]
+    amount = data["amount"]
+
+    note = (message.text or "").strip()
+    if note == "-":
+        note = ""
+
+    from_wallet = db.get_wallet(user_id, from_wallet_id)
+    to_wallet = db.get_wallet(user_id, to_wallet_id)
+
+    # Ghi 1 giao dịch "chi" ở ví nguồn
+    db.add_transaction(
+        user_id,
+        "expense",
+        amount,
+        f"Chuyển sang ví {to_wallet['name']}",
+        note,
+        from_wallet_id,
+    )
+
+    # Ghi 1 giao dịch "thu" ở ví đích
+    db.add_transaction(
+        user_id,
+        "income",
+        amount,
+        f"Chuyển từ ví {from_wallet['name']}",
+        note,
+        to_wallet_id,
+    )
+
+    await state.clear()
+    await message.answer(
+        "✅ Đã chuyển tiền giữa ví:\n\n"
+        f"• Từ: *{from_wallet['name']}*\n"
+        f"• Sang: *{to_wallet['name']}*\n"
+        f"• Số tiền: `{amount:,.0f}`\n"
+        f"• Ghi chú: {note or 'Không có'}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
 # ---------- /report ----------
+
 
 @router.message(Command("report"))
 async def cmd_report(message: Message):
@@ -1448,12 +1768,37 @@ async def cb_report_categories(call: CallbackQuery):
     rows = db.get_category_summary_month(user_id, today.year, today.month)
     if not rows:
         text = "📊 *Thống kê theo danh mục (tháng này)*\n\nChưa có chi tiêu nào."
-    else:
-        lines = ["📊 *Thống kê chi tiêu theo danh mục (tháng này)*\n"]
-        for r in rows:
-            lines.append(f"• {r['category']}: `{r['total']:,.0f}`")
-        text = "\n".join(lines)
-    await call.message.edit_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=report_menu_inline_kb())
+        await call.message.edit_text(
+            text,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=report_menu_inline_kb(),
+        )
+        await call.answer()
+        return
+
+    lines = ["📊 *Thống kê chi tiêu theo danh mục (tháng này)*\n"]
+    max_val = max(r["total"] for r in rows) or 1
+    BAR_WIDTH = 20
+
+    for r in rows:
+        cat = r["category"]
+        val = r["total"]
+        bar_len = int(val / max_val * BAR_WIDTH) if max_val > 0 else 0
+        bar = "█" * bar_len
+        lines.append(f"{cat:15} {bar} `{val:,.0f}`")
+
+    # Top 3 khoản chi lớn nhất
+    top3 = rows[:3]
+    lines.append("\n🔥 *Top 3 danh mục chi lớn nhất:*")
+    for i, r in enumerate(top3, start=1):
+        lines.append(f"{i}. {r['category']}: `{r['total']:,.0f}`")
+
+    text = "\n".join(lines)
+    await call.message.edit_text(
+        text,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=report_menu_inline_kb(),
+    )
     await call.answer()
 
 
@@ -1469,7 +1814,69 @@ async def cb_report_balance(call: CallbackQuery):
     await call.answer()
 
 
+# ---------- /insights – phân tích chi tiêu ----------
+
+
+@router.message(Command("insights"))
+async def cmd_insights(message: Message):
+    """
+    Phân tích nhanh: so sánh 30 ngày gần nhất với 30 ngày trước đó
+    + top danh mục đang chi nhiều trong tháng này.
+    """
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    now = datetime.utcnow()
+
+    recent_end = now
+    recent_start = recent_end - timedelta(days=30)
+    prev_end = recent_start
+    prev_start = prev_end - timedelta(days=30)
+
+    recent = db.get_summary(user_id, recent_start, recent_end)
+    prev = db.get_summary(user_id, prev_start, prev_end)
+
+    recent_exp = recent["expense"]
+    prev_exp = prev["expense"]
+
+    diff = recent_exp - prev_exp
+    trend = "tăng" if diff > 0 else "giảm" if diff < 0 else "không đổi"
+    diff_abs = abs(diff)
+
+    today = date.today()
+    cats = db.get_category_summary_month(user_id, today.year, today.month)
+
+    lines = ["📈 *Phân tích chi tiêu (insights)*\n"]
+    lines.append(
+        f"• 30 ngày gần nhất: Chi tiêu `{recent_exp:,.0f}`\n"
+        f"• 30 ngày trước đó: `{prev_exp:,.0f}`"
+    )
+
+    if diff != 0:
+        lines.append(
+            f"➡️ Bạn đang chi *{trend}* khoảng `{diff_abs:,.0f}` so với 30 ngày trước."
+        )
+    else:
+        lines.append("➡️ Chi tiêu của bạn *gần như không đổi* so với 30 ngày trước.")
+
+    if cats:
+        lines.append("\n🔥 *Danh mục chi nhiều nhất tháng này:*")
+        top = cats[0]
+        lines.append(f"• {top['category']}: `{top['total']:,.0f}`")
+        if len(cats) >= 3:
+            lines.append("\n📌 Gợi ý:")
+            lines.append(
+                f"- Theo dõi kỹ danh mục *{top['category']}* trong vài tuần tới.\n"
+                "- Cân nhắc đặt hạn mức bằng /limit nếu bạn thấy mục này hay bị vượt."
+            )
+
+    await message.answer(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
 # ---------- /goals ----------
+
 
 @router.message(Command("goals"))
 async def cmd_goals(message: Message, state: FSMContext):
@@ -1679,6 +2086,7 @@ async def goal_money_note(message: Message, state: FSMContext):
 
 # ---------- /transactions – xem & sửa/xoá ----------
 
+
 @router.message(Command("transactions"))
 async def cmd_transactions(message: Message):
     user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
@@ -1850,6 +2258,7 @@ async def edit_tx_field_value(message: Message, state: FSMContext):
 
 # ---------- /categories – quản lý danh mục ----------
 
+
 @router.message(Command("categories"))
 async def cmd_categories(message: Message, state: FSMContext):
     await state.clear()
@@ -1965,6 +2374,7 @@ async def cb_cat_delete(call: CallbackQuery):
 
 # ---------- /limit – đặt hạn mức chi tiêu ----------
 
+
 @router.message(Command("limit"))
 async def cmd_limit(message: Message, state: FSMContext):
     await state.set_state(LimitStates.choosing_category)
@@ -2027,7 +2437,8 @@ async def limit_enter_amount(message: Message, state: FSMContext):
     )
 
 
-# ---------- /export – xuất CSV ----------
+# ---------- /export – xuất CSV toàn bộ ----------
+
 
 @router.message(Command("export"))
 async def cmd_export(message: Message):
@@ -2097,7 +2508,280 @@ async def cmd_export(message: Message):
     )
 
 
+# ---------- /export_month – xuất CSV theo tháng ----------
+
+
+@router.message(Command("export_month"))
+async def cmd_export_month(message: Message, state: FSMContext):
+    """
+    Xuất giao dịch theo *một tháng cụ thể* ra file CSV.
+    """
+    db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    await state.set_state(ExportMonthStates.entering_period)
+    await message.answer(
+        "📤 *Xuất CSV theo tháng*\n\n"
+        "Nhập tháng bạn muốn xuất theo một trong các cách:\n"
+        "• `03-2025` hoặc `3-2025`\n"
+        "• `03/2025` hoặc `3/2025`\n"
+        "• Hoặc gõ: `tháng này`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.message(ExportMonthStates.entering_period)
+async def export_month_enter_period(message: Message, state: FSMContext):
+    text = (message.text or "").strip().lower()
+
+    # 1) "tháng này"
+    if "tháng này" in text or text.replace(" ", "") in ["thangnay", "thangnày"]:
+        today = date.today()
+        month = today.month
+        year = today.year
+    else:
+        # 2) parse dạng MM-YYYY hoặc M/YYYY
+        m = re.search(r"(\d{1,2})[^\d]+(\d{4})", text)
+        if not m:
+            await message.answer(
+                "❌ Định dạng không hợp lệ.\n"
+                "Vui lòng nhập lại, ví dụ: `03-2025`, `3/2025` hoặc `tháng này`.",
+                reply_markup=main_menu_kb(),
+            )
+            return
+        month = int(m.group(1))
+        year = int(m.group(2))
+        if month < 1 or month > 12:
+            await message.answer("❌ Tháng phải từ 1 đến 12. Nhập lại giúp mình nhé.")
+            return
+
+    await state.clear()
+
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    rows = db.get_transactions_for_month_export(user_id, year, month)
+
+    if not rows:
+        await message.answer(
+            f"📤 Tháng {month:02d}/{year} không có giao dịch nào để xuất.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    lines = []
+    header = "id,datetime_utc,type,amount,category,note,wallet"
+    lines.append(header)
+
+    for r in rows:
+        tx_id = r["id"]
+        dt = r["created_at"] or ""
+        tx_type = r["type"] or ""
+        amount = r["amount"] or 0
+        category = r["category"] or ""
+        note = r["note"] or ""
+        wallet_name = r["wallet_name"] or ""
+
+        def csv_escape(s: str) -> str:
+            s = s.replace('"', '""')
+            if ("," in s) or ("\n" in s) or ("\r" in s):
+                return f'"{s}"'
+            return s
+
+        line = ",".join(
+            [
+                str(tx_id),
+                csv_escape(dt),
+                csv_escape(tx_type),
+                str(int(amount)),
+                csv_escape(category),
+                csv_escape(note),
+                csv_escape(wallet_name),
+            ]
+        )
+        lines.append(line)
+
+    csv_content = "\n".join(lines)
+    csv_bytes = csv_content.encode("utf-8")
+
+    filename = f"transactions_{year}_{month:02d}.csv"
+    buf = BufferedInputFile(
+        csv_bytes,
+        filename=filename,
+    )
+
+    await message.answer_document(
+        document=buf,
+        caption=(
+            f"📤 Đây là file *CSV* giao dịch tháng {month:02d}/{year}.\n"
+            "Bạn có thể mở bằng *Excel*, *Google Sheets* hoặc bất kỳ ứng dụng bảng tính nào."
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ---------- /export_wallet – xuất CSV theo từng ví ----------
+
+
+@router.message(Command("export_wallet"))
+async def cmd_export_wallet(message: Message):
+    """
+    Xuất giao dịch theo *từng ví* ra file CSV.
+    Bước 1: cho user chọn ví bằng inline keyboard.
+    """
+    user_id = db.get_or_create_user(message.from_user.id, message.from_user.full_name)
+    db.ensure_default_wallets(user_id)
+    wallets = db.get_wallets(user_id)
+
+    if not wallets:
+        await message.answer(
+            "📤 Hiện bạn chưa có ví nào để xuất.\n"
+            "Thử ghi lương bằng /salary hoặc thêm giao dịch trước nhé.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    buttons = []
+    for w in wallets:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{w['name']}",
+                    callback_data=f"export_wallet|{w['id']}",
+                )
+            ]
+        )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await message.answer(
+        "📤 *Xuất CSV theo từng ví*\n\n"
+        "Chọn *ví* bạn muốn xuất dữ liệu:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("export_wallet|"))
+async def cb_export_wallet(call: CallbackQuery):
+    """
+    Khi user bấm chọn 1 ví, bot sẽ tạo CSV cho riêng ví đó và gửi file.
+    """
+    _, wallet_id_str = call.data.split("|", maxsplit=1)
+    try:
+        wallet_id = int(wallet_id_str)
+    except ValueError:
+        await call.answer("Dữ liệu ví không hợp lệ.", show_alert=True)
+        return
+
+    user_id = db.get_or_create_user(call.from_user.id, call.from_user.full_name)
+    wallet = db.get_wallet(user_id, wallet_id)
+    if not wallet:
+        await call.answer("Không tìm thấy ví này.", show_alert=True)
+        return
+
+    rows = db.get_transactions_for_wallet_export(user_id, wallet_id)
+
+    if not rows:
+        await call.message.edit_text(
+            f"📤 Ví *{wallet['name']}* hiện chưa có giao dịch nào để xuất.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        await call.answer()
+        return
+
+    lines = []
+    header = "id,datetime_utc,type,amount,category,note,wallet"
+    lines.append(header)
+
+    for r in rows:
+        tx_id = r["id"]
+        dt = r["created_at"] or ""
+        tx_type = r["type"] or ""
+        amount = r["amount"] or 0
+        category = r["category"] or ""
+        note = r["note"] or ""
+        wallet_name = r["wallet_name"] or ""
+
+        def csv_escape(s: str) -> str:
+            s = s.replace('"', '""')
+            if ("," in s) or ("\n" in s) or ("\r" in s):
+                return f'"{s}"'
+            return s
+
+        line = ",".join(
+            [
+                str(tx_id),
+                csv_escape(dt),
+                csv_escape(tx_type),
+                str(int(amount)),
+                csv_escape(category),
+                csv_escape(note),
+                csv_escape(wallet_name),
+            ]
+        )
+        lines.append(line)
+
+    csv_content = "\n".join(lines)
+    csv_bytes = csv_content.encode("utf-8")
+
+    filename = f"transactions_wallet_{wallet_id}.csv"
+    buf = BufferedInputFile(
+        csv_bytes,
+        filename=filename,
+    )
+
+    await call.message.edit_text(
+        f"📤 Đang gửi file CSV cho ví *{wallet['name']}*...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    await call.message.answer_document(
+        document=buf,
+        caption=(
+            f"📤 Đây là file *CSV* giao dịch của ví *{wallet['name']}*.\n"
+            "Bạn có thể mở bằng *Excel*, *Google Sheets* hoặc bất kỳ ứng dụng bảng tính nào."
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+    await call.answer()
+
+
+# ---------- /backup – sao lưu file DB ----------
+
+
+@router.message(Command("backup"))
+async def cmd_backup(message: Message):
+    """
+    Gửi cho bạn file database SQLite hiện tại để tự backup.
+    LƯU Ý: file này chứa dữ liệu của tất cả user đang dùng bot.
+    """
+    if not os.path.exists(DB_PATH):
+        await message.answer(
+            "❌ Không tìm thấy file database để backup.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    with open(DB_PATH, "rb") as f:
+        data = f.read()
+
+    buf = BufferedInputFile(
+        data,
+        filename=os.path.basename(DB_PATH),
+    )
+
+    await message.answer_document(
+        document=buf,
+        caption=(
+            "📦 Đây là file *database* hiện tại của bot.\n"
+            "Bạn hãy lưu trữ cẩn thận (Drive, cloud, USB,...) để backup."
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_kb(),
+    )
+
+
 # ---------- FALLBACK ----------
+
 
 @router.message()
 async def fallback_handler(message: Message):
@@ -2122,6 +2806,7 @@ async def fallback_handler(message: Message):
 # ==========================
 # WEBHOOK + AIOHTTP
 # ==========================
+
 
 async def on_startup(bot: Bot):
     if not WEBHOOK_URL:
